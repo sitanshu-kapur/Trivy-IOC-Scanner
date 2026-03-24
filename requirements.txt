@@ -1,0 +1,6 @@
+# No third-party dependencies required.
+# The scanner uses only Python standard library modules:
+#   argparse, hashlib, json, os, platform, re, subprocess, sys, pathlib, urllib
+#
+# Optional: install PyYAML if you want strict YAML parsing instead of regex scanning
+# pyyaml>=6.0
