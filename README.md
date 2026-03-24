@@ -29,8 +29,8 @@ Python 3.9+ — no third-party dependencies.
 ## Installation
 
 ```bash
-git clone <this-repo>
-cd trivy
+git clone https://github.com/sitanshu-kapur/Trivy-IOC-Scanner.git
+cd Trivy-IOC-Scanner
 python scanner.py --help
 ```
 
