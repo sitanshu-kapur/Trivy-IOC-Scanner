@@ -12,6 +12,7 @@ Reference: [Wiz Research — Trivy Compromised](https://www.wiz.io/blog/trivy-co
 | **Container image scanning** | Docker images tagged `0.69.4` and Trivy binaries embedded inside any local image |
 | **Persistence artifacts** | `~/.config/systemd/user/sysmon.py`, the systemd unit/timer files, `/tmp/pglog` dropper, and `tpcp.tar.gz` credential bundles |
 | **GitHub Actions audit** | Workflow YAML files referencing `aquasecurity/trivy-action` or `aquasecurity/setup-trivy`, cross-referenced against all 82 known malicious commit hashes |
+| **GitHub Actions run log audit** | Queries the GitHub API for workflow runs that executed during the March 19–20 compromise window, checks job step names for affected action signatures, downloads and scans the run logs for C2 indicators and malicious version strings |
 | **GitHub org audit** | Searches a GitHub organization for a repository named `tpcp-docs` — the fallback exfiltration repo created by the malware |
 | **Network log sweeping** | Shell history, `/etc/hosts`, systemd journal, macOS DNS logs, `/var/log/*`, and Windows DNS cache for C2 indicators |
 
@@ -66,6 +67,17 @@ python scanner.py --github-token ghp_yourtoken --github-org your-org-name
 python scanner.py --network
 ```
 
+### Audit GitHub Actions run logs for the compromise window
+
+```bash
+python scanner.py \
+  --github-token ghp_yourtoken \
+  --github-repo your-org/your-repo \
+  --github-repo your-org/another-repo
+```
+
+This queries the GitHub API for any workflow runs that executed between March 19–20, 2026, checks their job steps for `Run Trivy` / `Setup environment` signatures, and downloads and scans the full logs for C2 indicators, `v0.69.4` version strings, `tpcp.tar.gz`, and other IOCs. Requires a PAT with `repo` and `actions:read` scope.
+
 ### Full scan
 
 ```bash
@@ -74,6 +86,7 @@ python scanner.py \
   --workflows .github/workflows \
   --github-token ghp_yourtoken \
   --github-org your-org-name \
+  --github-repo your-org/your-repo \
   --network
 ```
 
@@ -93,6 +106,7 @@ Exits with code `1` if any CRITICAL or HIGH findings are present, `0` if clean.
 | `--workflows PATH` | Directory to scan for GitHub Actions YAML files. Default: `.github/workflows` |
 | `--github-token PAT` | GitHub Personal Access Token for org-level audit |
 | `--github-org ORG` | GitHub organization to search for `tpcp-docs` repository |
+| `--github-repo OWNER/REPO` | Repo to audit for Actions run logs during the March 19–20 window. Repeatable. Requires `--github-token`. |
 | `--network` | Enable network log and shell history sweeping |
 | `--skip-docker` | Skip container image scanning |
 | `--json` | Output results as JSON |
@@ -102,9 +116,9 @@ Exits with code `1` if any CRITICAL or HIGH findings are present, `0` if clean.
 
 | Level | Meaning |
 |---|---|
-| `CRITICAL` | Confirmed IOC — hash match, known malicious action commit, persistence artifact found, or `tpcp-docs` repo present |
-| `HIGH` | Strong indicator — mutable action tag reference (force-pushable), or Trivy binary found inside container image |
-| `INFO` | Informational — action pinned to full SHA not in malicious list; verify manually against the March 19–20, 2026 window |
+| `CRITICAL` | Confirmed IOC — hash match, known malicious action commit, persistence artifact found, `tpcp-docs` repo present, or C2 indicator found in run logs |
+| `HIGH` | Strong indicator — mutable action tag reference (force-pushable), Trivy binary found inside container image, or a run step name matches a compromised action |
+| `INFO` | Informational — action pinned to full SHA not in malicious list, or run logs have expired (cannot confirm/deny) |
 
 ## Recommended response steps
 

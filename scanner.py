@@ -712,6 +712,186 @@ def check_network_logs(quiet: bool, use_color: bool) -> list[Finding]:
 
     return findings
 
+# ---------------------------------------------------------------------------
+# Check 6: GitHub Actions Run Log Audit
+# ---------------------------------------------------------------------------
+
+COMPROMISE_WINDOW_START = "2026-03-19T00:00:00Z"
+COMPROMISE_WINDOW_END   = "2026-03-21T00:00:00Z"
+
+# Step names injected by the compromised actions
+AFFECTED_STEP_NAMES = [
+    "run trivy",         # aquasecurity/trivy-action entrypoint step
+    "setup environment", # aquasecurity/setup-trivy setup step
+]
+
+# Strings to search for inside downloaded run logs
+LOG_IOC_PATTERNS = C2_INDICATORS + [
+    "v0.69.4",
+    "0.69.4",
+    "tpcp.tar.gz",
+    "tpcp-docs",
+    "sysmon.py",
+    "TeamPCP",
+    "teamPCP",
+]
+
+
+def check_workflow_run_logs(
+    token: str,
+    repos: list[str],
+    quiet: bool,
+    use_color: bool,
+) -> list[Finding]:
+    """
+    Query GitHub Actions run history for the compromise window and scan logs
+    for C2 indicators, malicious version strings, and affected step names.
+    Requires a PAT with repo/actions:read scope.
+    """
+    import io
+    import urllib.error
+    import urllib.request
+    import zipfile
+
+    findings = []
+
+    if not quiet:
+        print(_c(Color.BOLD, "\n[6] GitHub Actions Run Log Audit", use_color))
+        print(f"  Compromise window: {COMPROMISE_WINDOW_START} -> {COMPROMISE_WINDOW_END}")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    def gh_get(url: str) -> dict:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    for repo in repos:
+        if not quiet:
+            print(f"\n  Repo: {repo}")
+
+        # --- List runs created in the compromise window ---
+        runs_url = (
+            f"https://api.github.com/repos/{repo}/actions/runs"
+            f"?created={COMPROMISE_WINDOW_START}..{COMPROMISE_WINDOW_END}&per_page=100"
+        )
+
+        try:
+            data = gh_get(runs_url)
+        except urllib.error.HTTPError as e:
+            findings.append(Finding(
+                check="github_api_error",
+                severity=Severity.INFO,
+                path=f"github.com/{repo}",
+                detail=f"Could not list workflow runs: HTTP {e.code} — check token scope (needs repo/actions:read).",
+            ))
+            continue
+        except Exception as e:
+            findings.append(Finding(
+                check="github_api_error",
+                severity=Severity.INFO,
+                path=f"github.com/{repo}",
+                detail=f"Could not list workflow runs: {e}",
+            ))
+            continue
+
+        runs = data.get("workflow_runs", [])
+        if not runs:
+            if not quiet:
+                print("    No workflow runs found in the compromise window.")
+            continue
+
+        if not quiet:
+            print(f"    {len(runs)} run(s) found in the March 19-20 window.")
+
+        for run in runs:
+            run_id       = run["id"]
+            run_name     = run.get("name", "unknown")
+            run_html_url = run.get("html_url", f"github.com/{repo}/actions/runs/{run_id}")
+            triggered_at = run.get("created_at", "unknown")
+            conclusion   = run.get("conclusion", "unknown")
+
+            if not quiet:
+                print(f"    Checking run: {run_name} ({triggered_at}, conclusion={conclusion})")
+
+            # --- Check jobs/steps for affected action step names ---
+            try:
+                jobs_data = gh_get(
+                    f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/jobs"
+                )
+            except Exception:
+                jobs_data = {"jobs": []}
+
+            for job in jobs_data.get("jobs", []):
+                job_name = job.get("name", str(job.get("id", "")))
+                for step in job.get("steps", []):
+                    step_name = step.get("name", "")
+                    if any(s in step_name.lower() for s in AFFECTED_STEP_NAMES):
+                        step_conclusion = step.get("conclusion", "unknown")
+                        findings.append(Finding(
+                            check="workflow_run_affected_step",
+                            severity=Severity.HIGH,
+                            path=f"{run_html_url} — job: {job_name}",
+                            detail=(
+                                f"Step '{step_name}' (conclusion: {step_conclusion}) matches a "
+                                f"compromised action step name. Run '{run_name}' triggered at "
+                                f"{triggered_at}. Review full logs for this run."
+                            ),
+                        ))
+
+            # --- Download and scan full run logs ---
+            logs_url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/logs"
+            req = urllib.request.Request(logs_url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    zip_bytes = resp.read()
+
+                with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+                    for log_name in zf.namelist():
+                        try:
+                            with zf.open(log_name) as lf:
+                                log_text = lf.read().decode("utf-8", errors="replace")
+                        except Exception:
+                            continue
+
+                        seen_in_this_log: set[str] = set()
+                        for indicator in LOG_IOC_PATTERNS:
+                            if indicator in log_text and indicator not in seen_in_this_log:
+                                seen_in_this_log.add(indicator)
+                                findings.append(Finding(
+                                    check="workflow_log_ioc",
+                                    severity=Severity.CRITICAL,
+                                    path=f"{run_html_url} — log: {log_name}",
+                                    detail=(
+                                        f"IOC '{indicator}' found in run logs for '{run_name}' "
+                                        f"(triggered {triggered_at}). This run likely executed "
+                                        f"malicious code from the compromised action."
+                                    ),
+                                ))
+
+            except urllib.error.HTTPError as e:
+                if e.code == 410:
+                    # Logs expired (GitHub retains them for 90 days)
+                    findings.append(Finding(
+                        check="workflow_log_expired",
+                        severity=Severity.INFO,
+                        path=run_html_url,
+                        detail=(
+                            f"Logs for run '{run_name}' ({triggered_at}) are no longer available "
+                            f"(HTTP 410 Gone). Cannot confirm or rule out compromise for this run."
+                        ),
+                    ))
+            except Exception:
+                pass
+
+    return findings
+
+
+# ---------------------------------------------------------------------------
 SEVERITY_COLOR = {
     Severity.CRITICAL: Color.RED,
     Severity.HIGH:     Color.YELLOW,
@@ -779,6 +959,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--github-org", metavar="ORG", dest="github_org",
         help="GitHub organization name to search for tpcp-docs repository",
+    )
+    p.add_argument(
+        "--github-repo", metavar="OWNER/REPO", action="append", dest="github_repos",
+        help=(
+            "GitHub repo (owner/repo) to audit for Actions run logs during the compromise window. "
+            "Can be specified multiple times. Requires --github-token."
+        ),
     )
     p.add_argument(
         "--network", action="store_true",
@@ -860,6 +1047,17 @@ def main():
     elif not quiet:
         print(_c(Color.BOLD, "\n[5] Network Log Sweeping", use_color))
         print("  Skipped. Pass --network to enable.")
+
+    if args.github_repos and args.github_token:
+        all_findings += check_workflow_run_logs(
+            args.github_token, args.github_repos, quiet, use_color
+        )
+    elif args.github_repos and not args.github_token:
+        if not quiet:
+            print("\n  [!] --github-repo requires --github-token to query run logs.")
+    elif not quiet:
+        print(_c(Color.BOLD, "\n[6] GitHub Actions Run Log Audit", use_color))
+        print("  Skipped. Pass --github-token and --github-repo OWNER/REPO to enable.")
 
     # Output
     if json_mode:
