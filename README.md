@@ -2,7 +2,6 @@
 
 A CLI tool to detect Indicators of Compromise (IOCs) from the TeamPCP supply chain attack that backdoored Aqua Security's Trivy scanner on March 19, 2026.
 
-Reference: [Wiz Research — Trivy Compromised](https://www.wiz.io/blog/trivy-compromised-supply-chain-attack)
 
 ## What it detects
 
